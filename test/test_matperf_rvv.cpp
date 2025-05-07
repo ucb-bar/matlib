@@ -23,6 +23,14 @@ inline void test_matmul() {
     matmul(A, B, actual, N, M, O, 8);
     total = read_cycles() - start;
     printf("%lu\n", total);
+    matset(actual, 0.0, N, M);
+    printf("matmuli:        ");
+    int *ID = (int *)malloc(sizeof(int) * N);
+    for (int i = 0; i < N; i++) ID[i] = i * O;
+    start = read_cycles();
+    matmul(A, B, actual, N, M, O, 8, ID);
+    total = read_cycles() - start;
+    printf("%lu\n", total);
 }
 
 inline void test_matvec() {

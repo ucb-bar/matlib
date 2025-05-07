@@ -20,8 +20,8 @@ void cwiseabs_rvv(float *a, float *b, int n, int m);
 void cwisemin_rvv(float *a, float *b, float *c, int n, int m);
 void cwisemax_rvv(float *a, float *b, float *c, int n, int m);
 void cwisemul_rvv(float *a, float *b, float *c, int n, int m);
-void matmul_rvv(float *a, float *b, float *c, int n, int m, int o, int tile_size);
-void matmul_rvvt(float *a, float *b, float *c, int i, int j, int k, int n, int m, int o, int tile_size);
+void matmul_rvv(float *a, float *b, float *c, int n, int m, int o, int tile_size, int *ind_a);
+void matmul_rvvt(float *a, float *b, float *c, int i, int j, int k, int n, int m, int o, int tile_size, int *ind_a);
 void matvec_rvv(float *a, float *b, float *c, int n, int m);
 void matvec_transpose_rvv(float *a, float *b, float *c, int n, int m);
 void matmulf_rvv(float *a, float *b, float f, int n, int m);
@@ -50,6 +50,8 @@ void matsetv_rvv(float *a, float *f, int n, int m);
 #define matcopy matcopy_rvv
 #define matset matset_rvv
 #define matsetv matsetv_rvv
+
+#define BATCH 4
 
 
 // matrix maximum coefficient
@@ -156,7 +158,7 @@ inline void cwisemax_rvv(float *ptr_a, float *ptr_b, float *ptr_c, int n, int m)
 
 // matrix multiplication, note B is not [o][m]
 // A[n][o], B[m][o] --> C[n][m];
-inline void matmul_rvv(float *a, float *b, float *c, int n, int m, int o, int tile_size = -1) {
+inline void matmul_rvv(float *a, float *b, float *c, int n, int m, int o, int tile_size = -1, int *ind_a = 0) {
     if (tile_size == -1) {
         size_t vlmax = __riscv_vsetvlmax_e32();
         vfloat32m1_t vec_zero = __riscv_vfmv_v_f_f32m1(0, vlmax);
@@ -188,15 +190,17 @@ inline void matmul_rvv(float *a, float *b, float *c, int n, int m, int o, int ti
             for (int j = 0; j < m; j += tile_size) {
                 for (int k = 0; k < o; k += tile_size) {
                     // printf("i: %d j: %d k: %d n: %d m: %d o: %d\n", i, j, k, n, m, o);
-                    matmul_rvvt(a, b, c, i, j, k, n, m, o, tile_size);
+                    matmul_rvvt(a, b, c, i, j, k, n, m, o, tile_size, ind_a);
                 }
             }
         }
     }
 }
 
-inline void matmul_rvvt(float *a, float *b, float *c, int i, int j, int k, int n, int m, int o, int tile_size) {
-    float *A = a + i * o + k;
+inline void matmul_rvvt(float *a, float *b, float *c, int i, int j, int k, int n, int m, int o, int tile_size, int *ind_a) {
+    vfloat32m1_t v1, v2, v3, v4, v5, v6, v7, v8;
+    vfloat32m1_t *vec_r[8] = { &v1, &v2, &v3, &v4, &v5, &v6, &v7, &v8 };
+    float *A = a + (ind_a ? ind_a[i] : i * o) + k;
     float *B = b + j * o + k;
     float *C = c + i * m + j;
     int N = i + tile_size <= n ? tile_size : n % tile_size;
@@ -206,24 +210,27 @@ inline void matmul_rvvt(float *a, float *b, float *c, int i, int j, int k, int n
     size_t vlmax = __riscv_vsetvlmax_e32();
     vfloat32m1_t vec_zero = __riscv_vfmv_v_f_f32m1(0, vlmax);
     for (int I = 0; I < N; ++I) {
-        float *ptr_a = A + I * O; // row major
-        int K1 = O;
-        for (size_t vl; K1 > 0; K1 -= vl, ptr_a += vl) {
-            vl = __riscv_vsetvl_e32(K1);
-            vfloat32_t vec_a = __riscv_vle32_v_f32(ptr_a, vl);
-
-            for (int J = 0; J < M; ++J) {
-                float *ptr_b = B + J * O; // column major
-                int K2 = O;
-                vfloat32_t vec_s = __riscv_vfmv_v_f_f32(0, vlmax);
-                for (size_t vl; K2 > 0; K2 -= vl, ptr_b += vl) {
-                    vl = __riscv_vsetvl_e32(K2);
-                    vfloat32_t vec_b = __riscv_vle32_v_f32(ptr_b, vl);
-                    vec_s = __riscv_vfmacc_vv_f32(vec_s, vec_a, vec_b, vl);
+        for (int J = 0; J < M; J += BATCH) {
+            int P = J + BATCH < M ? BATCH : M - J;
+            float *ptr_a = A + I * o; // row major
+            float *ptr_b = B + J * o; // column major
+            int K = O;
+            for (int L = 0; L < P; L++) {
+                *(vec_r[L]) = __riscv_vfmv_v_f_f32(0, vlmax);
+            }
+            for (size_t vl; K > 0; K -= vl, ptr_a += vl, ptr_b += vl) {
+                vl = __riscv_vsetvl_e32(K);
+                // printf("I: %d J: %d K: %d N: %d M: %d O: %d ptr_a: %x ptr_b: %x vl: %d\n", I, J, K, N, M, O, ptr_a, ptr_b, vl);
+                vfloat32_t vec_a = __riscv_vle32_v_f32(ptr_a, vl);
+                for (int L = 0; L < P; L++) {
+                    vfloat32_t vec_b = __riscv_vle32_v_f32(ptr_b + L * o, vl);
+                    *(vec_r[L]) = __riscv_vfmacc_vv_f32(*(vec_r[L]), vec_a, vec_b, vl);
                 }
-                vfloat32m1_t vec_sum = __riscv_vfredusum_vs_f32_f32(vec_s, vec_zero, vlmax);
+            }
+            for (int L = 0; L < P; L++) {
+                vfloat32m1_t vec_sum = __riscv_vfredusum_vs_f32_f32(*(vec_r[L]), vec_zero, vlmax);
                 float sum = __riscv_vfmv_f_s_f32m1_f32(vec_sum);
-                C[I * m + J] = k == 0 ? sum : C[I * m + J] + sum;
+                C[I * m + J + L] = k == 0 ? sum : C[I * m + J + L] + sum;
             }
         }
     }

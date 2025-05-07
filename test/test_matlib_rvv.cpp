@@ -39,6 +39,20 @@ int main() {
     total = read_cycles() - start;
     printf("%s (%lu)\n", compare_2d(golden, actual, N, M) ? "pass" : "fail", total);
 
+    matset(actual, 0.0, N, M);
+    printf("matmuli:        ");
+    int *ID = (int *)malloc(sizeof(int) * N);
+    for (int i = 0; i < N; i++) ID[i] = i * O;
+    start = read_cycles();
+    matmul(A, B, actual, N, M, O, 8, ID);
+    total = read_cycles() - start;
+    printf("%s (%lu)\n", compare_2d(golden, actual, N, M) ? "pass" : "fail", total);
+
+    // print_array_2d(A, N, O, "float32", "A");
+    // print_array_2d(B, M, O, "float32", "B");
+    // print_array_2d(golden, N, M, "float32", "golden");
+    // print_array_2d(actual, N, M, "float32", "actual");
+
     // array gen
     scalar_t *G = alloc_array_2d(N, M);
     scalar_t *H = alloc_array_2d(M, N);

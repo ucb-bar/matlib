@@ -14,6 +14,7 @@ class Unroller:
     lmul = 1
     sew = 64
     vlen = 512
+    batch = 4
     vlmax = int(lmul * vlen / sew)
     idx = 1
 
@@ -283,87 +284,100 @@ class Unroller:
         Unroller.idx += 3
 
     @classmethod
-    def matmul_tile(cls, indents, i, n, m, o, N, M, O, reset=False):
-        Unroller.print(indents, f"""\
-                        // n {n} m {m} o {o} N {N} M {M} O {O} \
-                        """)
-        for I in range(N):
-            for J in range(M):
-                k = O
-                Unroller.print(indents, f"""\
-                        ptr_{i} = A_{i} + {I * o};
-                        ptr_{i+1} = B_{i} + {J * o};
-                        vec_s_{i} = __riscv_vfmv_v_f_f64(0, vlmax_{i});\
-                        """)
-                while k > 0:
-                    vl = min(k, Unroller.vlmax)
-                    Unroller.print(indents, f"""\
-                        vec_{i} = __riscv_vle64_v_f64(ptr_{i}, {vl});
-                        vec_{i+1} = __riscv_vle64_v_f64(ptr_{i+1}, {vl});
-                        vec_s_{i} = __riscv_vfmacc_vv_f64(vec_s_{i}, vec_{i}, vec_{i+1}, {vl});\
-                        """)
-                    if k - vl > 0:
-                        Unroller.print(indents, f"""\
-                        ptr_{i} += {vl};
-                        ptr_{i+1} += {vl};\
-                        """)
-                    k -= vl
-                Unroller.print(indents, f"""\
-                        vec_sum_{i} = __riscv_vfredusum_vs_f64_f64(vec_s_{i}, vec_zero_{i}, vlmax_{i});
-                        C_{i}[{I * m + J}] { '=' if reset else '+=' } __riscv_vfmv_f_s_f64m1_f64(vec_sum_{i});\
-                        """)
-
-    @classmethod
-    def matmul(cls, indents, a, b, c, n, m, o, tile_size="-1"):
+    def matmul(cls, indents, a, b, c, n, m, o, tile_size="-1", ind_a=""):
         n = eval(n)
         m = eval(m)
         o = eval(o)
         t = eval(tile_size)
         i = Unroller.idx
-        nt = o % t
+        nt = n % t
         mt = m % t
         ot = o % t
         if t != -1:
+            def matmul_tile(N, M, O, reset=False):
+                indents28 = indents + " " * 28
+                Unroller.print(indents28, f"""\
+                                // n {n} m {m} o {o} N {N} M {M} O {O}\
+                                """)
+                for I in range(N):
+                    ptr_a = f"{a} + {ind_a}[i + {I}] + k" if ind_a else f"{a} + (i + {I}) * {o} + k"
+                    for J in range(0, M, Unroller.batch):
+                        P = Unroller.batch if J + Unroller.batch < M else M - J;
+                        Unroller.print(indents28, f"""\
+                                ptr_{i} = {ptr_a};
+                                ptr_{i+1} = B_{i} + {J * o};\
+                                """)
+                        k = O
+                        for L in range(P):
+                            Unroller.print(indents28, f"""\
+                                vec_r_{i}_{L} = __riscv_vfmv_v_f_f64(0, vlmax_{i});
+                                """)
+                        while k > 0:
+                            vl = min(k, Unroller.vlmax)
+                            Unroller.print(indents28, f"""\
+                                vec_{i} = __riscv_vle64_v_f64(ptr_{i}, {vl});\
+                                """)
+                            for L in range(P):
+                                Unroller.print(indents28, f"""\
+                                vec_{i+1} = __riscv_vle64_v_f64(ptr_{i+1} + {L * o}, {vl});
+                                vec_r_{i}_{L} = __riscv_vfmacc_vv_f64(vec_r_{i}_{L}, vec_{i}, vec_{i+1}, {vl});\
+                                """)
+                            if k - vl > 0:
+                                Unroller.print(indents28, f"""\
+                                ptr_{i} += {vl};
+                                ptr_{i+1} += {vl};\
+                                """)
+                            k -= vl
+                        for L in range(P):
+                            Unroller.print(indents28, f"""\
+                                vec_sum_{i} = __riscv_vfredusum_vs_f64_f64(vec_r_{i}_{L}, vec_zero_{i}, vlmax_{i});
+                                C_{i}[{I * m + J + L}] { '=' if reset else '+=' } __riscv_vfmv_f_s_f64m1_f64(vec_sum_{i});\
+                                """)
+
             def matmul_helper(reset):
-                Unroller.print(indents, f"""\
+                Unroller.print(indents + 16 * " ", f"""\
                                 if (a_full_{i}) {{
                                     if (b_full_{i}) {{
                                         if (c_full_{i}) {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, t, t, t, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(t, t, t, reset)
+                Unroller.print(indents + 24 * " ", f"""\
                                         }} else {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, t, t, ot, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(t, t, ot, reset)
+                Unroller.print(indents + 20 * " ", f"""\
                                         }}
                                     }} else {{
                                         if (c_full_{i}) {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, t, mt, t, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(t, mt, t, reset)
+                Unroller.print(indents + 24 * " ", f"""\
                                         }} else {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, t, mt, ot, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(t, mt, ot, reset)
+                Unroller.print(indents + 16 * " ", f"""\
                                         }}
                                     }}
                                 }} else {{
                                     if (b_full_{i}) {{
                                         if (c_full_{i}) {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, nt, t, t, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(nt, t, t, reset)
+                Unroller.print(indents + 24 * " ", f"""\
                                         }} else {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, nt, t, ot, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(nt, t, ot, reset)
+                Unroller.print(indents + 20 * " ", f"""\
                                         }}
                                     }} else {{
                                         if (c_full_{i}) {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, nt, mt, t, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(nt, mt, t, reset)
+                Unroller.print(indents + 24 * " ", f"""\
                                         }} else {{ """)
-                Unroller.matmul_tile(indents, i, n, m, o, nt, mt, ot, reset)
-                Unroller.print(indents, f"""\
+                matmul_tile(nt, mt, ot, reset)
+                Unroller.print(indents + 16 * " ", f"""\
                                         }}
                                     }}
                                 }}""")
                 
+            for L in range(Unroller.batch):
+                Unroller.print(indents, f"""\
+                vfloat64_t vec_r_{i}_{L};\
+                """)
             Unroller.print(indents, f"""\
                 vfloat64_t vec_s_{i}, vec_{i}, vec_{i+1}, vec_{i+2};
                 double *ptr_{i}; double *ptr_{i+1}; double *ptr_{i+2} = {c};
@@ -378,7 +392,6 @@ class Unroller:
                 for (int i = 0; i < {n}; i += {t}) {{
                     for (int j = 0; j < {m}; j += {t}) {{
                         for (int k = 0; k < {o}; k += {t}) {{
-                            double *A_{i} = {a} + i * {o} + k;
                             double *B_{i} = {b} + j * {o} + k;
                             double *C_{i} = {c} + i * {m} + j;
                             bool a_full_{i} = (i + {t}) < {n};
@@ -389,7 +402,7 @@ class Unroller:
                             int O_{i} = c_full_{i} ? {t} : ot_{i};
                             if (k == 0) {{ """)
             matmul_helper(True)
-            Unroller.print(indents, f"""\
+            Unroller.print(indents + 12 * " ", f"""\
                             }} else {{ """)
             matmul_helper(False)
             Unroller.print(indents, f"""\
@@ -645,6 +658,8 @@ if __name__ == "__main__":
                 print(f"{indents}// line {line_no}: {dedent(line)}", end="")
                 getattr(Unroller, method)(indents, *arguments)
             except Exception as e: 
+                #if DEBUG: 
+                print(f"// ERROR: {e}", end="")
                 print(f"{indents}{method}_rvv({match_void.group(3)});")
         elif match_return:
             indents = match_return.group(1)
